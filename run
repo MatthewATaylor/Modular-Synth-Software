@@ -1,0 +1,4 @@
+echo "Building..."
+g++ main.cpp -lpthread
+echo "Executing..."
+./a.out
