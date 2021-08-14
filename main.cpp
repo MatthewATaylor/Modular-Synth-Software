@@ -505,7 +505,7 @@ class OutputManager {
 				return;
 			}
 			
-			double outputVoltage = 5 - (keyID - 53) / 12.0;
+			double outputVoltage = (keyID - 53) / 12.0;
 			uint16_t dacValue = (uint16_t) (outputVoltage / 5.0 * 4095);
 			
 			dac.open(DAC_ADDR);
