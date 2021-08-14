@@ -9,14 +9,10 @@
 #include <math.h>
 #include <string.h>
 
-const char *MIDI_PATH = "/dev/midi1";
-const uint8_t DAC_ADDR = 0b1001000;
-const uint8_t ADC_ADDR = 0b1101010;
-const uint8_t GPIO_EXPANSION_ADDR = 0b0100010;
-
 class I2CDevice {
 	public:
 		I2CDevice(int i2cFile) : i2cFile(i2cFile) {}
+		I2CDevice() {}
 
 		/*
 		 * Initialize communications with the I2C slave of given address
@@ -30,7 +26,7 @@ class I2CDevice {
 		}
 
 	protected:
-		int i2cFile;
+		int i2cFile = -1;
 };
 
 class DAC : public I2CDevice {
@@ -43,6 +39,7 @@ class DAC : public I2CDevice {
 		};
 
 		DAC(int i2cFile) : I2CDevice(i2cFile) {}
+		DAC() {}
 
 		/*
 		 * Set command and access byte and write a 12-bit (0 to 4095) value to the DAC
@@ -63,6 +60,7 @@ class DAC : public I2CDevice {
 class ADC : public I2CDevice {
 	public:
 		ADC(int i2cFile) : I2CDevice(i2cFile) {}
+		ADC() {}
 
 		bool readData(uint16_t *out) {
 			uint8_t buffer[2];
@@ -92,7 +90,8 @@ class GPIOExpander : public I2CDevice {
 		enum class Port {A, B};
 
 		GPIOExpander(int i2cFile) : I2CDevice(i2cFile) {}
-		
+		GPIOExpander() {}
+
 		/*
 		 * Set direction of GPIO pins on specified port, where 1 = input and 0 = output
 		 */
@@ -103,6 +102,16 @@ class GPIOExpander : public I2CDevice {
 				printf("Error: Failed to write to GPIO expander pin\n");
 				return false;
 			}
+
+			// Turn off all outputs
+			for (uint8_t i = 0; i < 8; ++i) {
+				uint8_t pinIsInput = configuration & 1;
+				if (!pinIsInput) {
+					writePin(port, i, 0);
+				}
+				configuration >>= 1;
+			}
+
 			return true;
 		}
 
@@ -473,6 +482,68 @@ class MIDIPacketQueue {
 		size_t length = 0;
 };
 
+class OutputManager {
+	public:
+		OutputManager(int i2cFile) : dac(i2cFile), gpio(i2cFile) {
+			gpio.open(0b0100010);
+			gpio.pinMode(GPIOExpander::Port::A, 0);
+		}	
+
+		void pressKey(uint8_t keyID) {
+			uint8_t channelToWrite = NUM_CHANNELS;
+			bool keyIDTaken = false;
+			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
+				if (!channels[i].isOn && channelToWrite == NUM_CHANNELS) {
+					channelToWrite = i;
+				}
+				if (channels[i].isOn && channels[i].keyID == keyID) {
+					keyIDTaken = true;
+					break;
+				}
+			}
+			if (keyIDTaken || channelToWrite == NUM_CHANNELS) {
+				return;
+			}
+			
+			double outputVoltage = 5 - (keyID - 53) / 12.0;
+			uint16_t dacValue = (uint16_t) (outputVoltage / 5.0 * 4095);
+			
+			dac.open(DAC_ADDR);
+			dac.writeData(dacValue, DAC::Command::WRITE_UPDATE, channelToWrite);
+			
+			gpio.open(GPIO_EXPANDER_ADDR);
+			gpio.writePin(GPIOExpander::Port::A, channelToWrite, 1);
+			
+			channels[channelToWrite].isOn = true;
+			channels[channelToWrite].keyID = keyID;
+		}
+
+		void releaseKey(uint8_t keyID) {
+			gpio.open(GPIO_EXPANDER_ADDR);
+			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
+				if (channels[i].isOn && channels[i].keyID == keyID) {
+					gpio.writePin(GPIOExpander::Port::A, i, 0);
+					channels[i].isOn = false;
+				}
+			}
+		}
+
+	private:
+		struct OutputChannel {
+			bool isOn = false;
+			uint8_t keyID = 0;
+			unsigned int triggerMillis = 0;
+		};
+
+		static const uint8_t NUM_CHANNELS = 8;
+		static const uint8_t GPIO_EXPANDER_ADDR = 0b0100010;
+		static const uint8_t DAC_ADDR = 0b1001000;
+
+		OutputChannel channels[NUM_CHANNELS];
+		DAC dac;
+		GPIOExpander gpio;
+};	
+
 MIDIPacketQueue midiQueue;
 pthread_t midiThread;
 pthread_mutex_t midiLock;
@@ -510,18 +581,35 @@ bool midiInit() {
 }
 
 int main() {
-	/*
+	const uint8_t ADC_ADDR = 0b1101010;
+
 	int i2cFile = open("/dev/i2c-1", O_RDWR);
 	if (i2cFile < 0) {
 		printf("Error: Failed to open I2C bus\n");
 		return 1;
 	}
-	*/
-
-	// FOR MIDI: REMEMBER TO USE midiLock!
-
+	
+	OutputManager outputManager(i2cFile);
+	
 	LCD lcd(12, 13, 4, 5, 6, 7);
 	lcd.setup();
+
+	midiInit();
+
+	while (true) {
+		pthread_mutex_lock(&midiLock);
+		for (size_t i = 0; i < midiQueue.getLength(); ++i) {
+			const uint8_t *packet = midiQueue.getPacket(i);
+			if (packet[0] == 144) {
+				outputManager.pressKey(packet[1]);
+			}
+			else if (packet[0] == 128) {
+				outputManager.releaseKey(packet[1]);
+			}
+		}
+		midiQueue.clear();
+		pthread_mutex_unlock(&midiLock);
+	}
 
 	return 0;
 }
