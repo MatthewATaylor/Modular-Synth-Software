@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 class I2CDevice {
 	public:
@@ -337,8 +338,12 @@ class LCD {
 
 			usleep(50000);
 
-			ePin.writeValue(0);
-			rsPin.writeValue(0);
+			this->ePin.writeValue(0);
+			this->rsPin.writeValue(0);
+			this->db4Pin.writeValue(0);
+			this->db5Pin.writeValue(0);
+			this->db6Pin.writeValue(0);
+			this->db7Pin.writeValue(0);
 
 			writeData(0, 0, 1, 1);
 			usleep(4500);
@@ -354,30 +359,51 @@ class LCD {
 			writeData(0, 0, 1, 0);
 			writeData(1, 0, 0, 0);  // 2 lines, 5x8 dots
 
-			writeData(0, 0, 0, 0);
-			writeData(1, 0, 0, 0);  // Display off
-
-			writeData(0, 0, 0, 0);
-			writeData(0, 0, 0, 1);  // Display clear
+			setDisplayOn(false);
+			clear();
 
 			writeData(0, 0, 0, 0);
 			writeData(0, 1, 1, 0);  // Entry mode set (increment on write, no shift)
 
+			setDisplayOn(true);
+			returnHome();
+		}
 
+		void setDisplayOn(bool on) {
+			rsPin.writeValue(0);
 			writeData(0, 0, 0, 0);
-			writeData(1, 1, 0, 0);  // Display on
+			writeData(1, on, 0, 0);
+		}
 
+		void clear() {
+			rsPin.writeValue(0);
 			writeData(0, 0, 0, 0);
-			writeData(0, 0, 1, 0);  // Set cursor to home position
+			writeData(0, 0, 0, 1);
 			usleep(2000);
+		}
 
+		void returnHome() {
+			rsPin.writeValue(0);
+			writeData(0, 0, 0, 0);
+			writeData(0, 0, 1, 0);
+			usleep(2000);
+		}
+
+		void writeChar(char character) {
 			rsPin.writeValue(1);
-			
-			writeData(0, 1, 1, 0);
-			writeData(1, 0, 0, 0);  // h
+			bool bits[8] = {0};  // Lower bits ordered first
+			for (uint8_t i = 0; i < 8; ++i) {
+				bits[i] = character & 1;
+				character >>= 1;
+			}
+			writeData(bits[7], bits[6], bits[5], bits[4]);
+			writeData(bits[3], bits[2], bits[1], bits[0]);
+		}
 
-			writeData(0, 1, 1, 0);
-			writeData(1, 0, 0, 1);
+		void writeStr(const char *str) {
+			for (size_t i = 0; str[i] != '\0'; ++i) {
+				writeChar(str[i]);
+			}
 		}
 
 	private:
@@ -580,6 +606,10 @@ bool midiInit() {
 	return true;
 }
 
+double getTimespecSeconds(struct timespec *spec) {
+	return spec->tv_sec + spec->tv_nsec / 1000000000.0;
+}
+
 int main() {
 	const uint8_t ADC_ADDR = 0b1101010;
 
@@ -593,8 +623,14 @@ int main() {
 	
 	LCD lcd(12, 13, 4, 5, 6, 7);
 	lcd.setup();
+	lcd.writeStr("Welcome!");
 
 	midiInit();
+
+	DigitalInputPin restPin(14);
+	restPin.setup();
+	double lastRestOffTime = 0.0;
+	bool restValue = 0;
 
 	while (true) {
 		pthread_mutex_lock(&midiLock);
@@ -609,7 +645,27 @@ int main() {
 		}
 		midiQueue.clear();
 		pthread_mutex_unlock(&midiLock);
+
+		restPin.readValue(&restValue);
+		struct timespec currentTime;
+		clock_gettime(CLOCK_REALTIME, &currentTime);
+		if (restValue) {
+			if (getTimespecSeconds(&currentTime) - lastRestOffTime > 3.0) {
+				break;
+			}
+		}
+		else {
+			lastRestOffTime = getTimespecSeconds(&currentTime);
+		}
 	}
+
+	lcd.clear();
+	lcd.returnHome();
+	lcd.writeStr("Goodbye!");
+
+	usleep(3000000);
+	lcd.clear();
+	lcd.returnHome();
 
 	return 0;
 }
