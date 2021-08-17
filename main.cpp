@@ -573,6 +573,7 @@ class OutputManager {
 MIDIPacketQueue midiQueue;
 pthread_t midiThread;
 pthread_mutex_t midiLock;
+const uint8_t MIDI_PACKET_SIZE = 3;
 
 void *midiRead(void *arg) {
 	int descriptor = open("/dev/midi1", O_RDONLY);
@@ -581,8 +582,8 @@ void *midiRead(void *arg) {
 		return nullptr;
 	}
 	while (true) {
-		uint8_t packet[4];
-		if (read(descriptor, packet, 4) == -1) {
+		uint8_t packet[MIDI_PACKET_SIZE];
+		if (read(descriptor, packet, MIDI_PACKET_SIZE) == -1) {
 			printf("Error: Failed to read MIDI packet\n");
 			return nullptr;
 		}
