@@ -508,21 +508,46 @@ class MIDIPacketQueue {
 		size_t length = 0;
 };
 
+class Timer {
+	public:
+		Timer() {
+			set();
+		}
+
+		void set() {
+			clock_gettime(CLOCK_MONOTONIC, &setTime);
+		}
+
+		double get_s() {
+			struct timespec currentTime;
+			clock_gettime(CLOCK_MONOTONIC, &currentTime);
+			return currentTime.tv_sec - setTime.tv_sec + (currentTime.tv_nsec - setTime.tv_nsec) / 1000000000.0;
+		}
+
+		double get_ms() {
+			return get_s() * 1000.0;
+		}
+
+	private:
+		struct timespec setTime;
+};
+
 class OutputManager {
 	public:
 		OutputManager(int i2cFile) : dac(i2cFile), gpio(i2cFile) {
 			gpio.open(0b0100010);
-			gpio.pinMode(GPIOExpander::Port::A, 0);
+			gpio.pinMode(GPIOExpander::Port::A, 0);  // Triggers
+			gpio.pinMode(GPIOExpander::Port::B, 0);  // Gates
 		}	
 
 		void pressKey(uint8_t keyID) {
 			uint8_t channelToWrite = NUM_CHANNELS;
 			bool keyIDTaken = false;
 			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
-				if (!channels[i].isOn && channelToWrite == NUM_CHANNELS) {
+				if (!channels[i].gateIsOn && channelToWrite == NUM_CHANNELS) {
 					channelToWrite = i;
 				}
-				if (channels[i].isOn && channels[i].keyID == keyID) {
+				if (channels[i].gateIsOn && channels[i].keyID == keyID) {
 					keyIDTaken = true;
 					break;
 				}
@@ -539,26 +564,40 @@ class OutputManager {
 			
 			gpio.open(GPIO_EXPANDER_ADDR);
 			gpio.writePin(GPIOExpander::Port::A, channelToWrite, 1);
-			
-			channels[channelToWrite].isOn = true;
+			gpio.writePin(GPIOExpander::Port::B, channelToWrite, 1);
+
 			channels[channelToWrite].keyID = keyID;
+			channels[channelToWrite].gateIsOn = true;
+			channels[channelToWrite].triggerIsOn = true;
+			channels[channelToWrite].triggerTimer.set();
 		}
 
 		void releaseKey(uint8_t keyID) {
 			gpio.open(GPIO_EXPANDER_ADDR);
 			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
-				if (channels[i].isOn && channels[i].keyID == keyID) {
+				if (channels[i].gateIsOn && channels[i].keyID == keyID) {
+					gpio.writePin(GPIOExpander::Port::B, i, 0);
+					channels[i].gateIsOn = false;
+				}
+			}
+		}
+
+		void updateTriggers() {
+			gpio.open(GPIO_EXPANDER_ADDR);
+			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
+				if (channels[i].triggerIsOn && channels[i].triggerTimer.get_ms() > 5.0) {
 					gpio.writePin(GPIOExpander::Port::A, i, 0);
-					channels[i].isOn = false;
+					channels[i].triggerIsOn = false;
 				}
 			}
 		}
 
 	private:
 		struct OutputChannel {
-			bool isOn = false;
 			uint8_t keyID = 0;
-			unsigned int triggerMillis = 0;
+			bool gateIsOn = false;
+			bool triggerIsOn = false;
+			Timer triggerTimer;
 		};
 
 		static const uint8_t NUM_CHANNELS = 8;
@@ -607,10 +646,6 @@ bool midiInit() {
 	return true;
 }
 
-double getTimespecSeconds(struct timespec *spec) {
-	return spec->tv_sec + spec->tv_nsec / 1000000000.0;
-}
-
 int main() {
 	const uint8_t ADC_ADDR = 0b1101010;
 
@@ -630,7 +665,7 @@ int main() {
 
 	DigitalInputPin restPin(14);
 	restPin.setup();
-	double lastRestOffTime = 0.0;
+	Timer restTimer;
 	bool restValue = 0;
 
 	while (true) {
@@ -647,16 +682,16 @@ int main() {
 		midiQueue.clear();
 		pthread_mutex_unlock(&midiLock);
 
+		outputManager.updateTriggers();
+
 		restPin.readValue(&restValue);
-		struct timespec currentTime;
-		clock_gettime(CLOCK_REALTIME, &currentTime);
 		if (restValue) {
-			if (getTimespecSeconds(&currentTime) - lastRestOffTime > 3.0) {
+			if (restTimer.get_s() > 3.0) {
 				break;
 			}
 		}
 		else {
-			lastRestOffTime = getTimespecSeconds(&currentTime);
+			restTimer.set();	
 		}
 	}
 
