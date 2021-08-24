@@ -10,6 +10,39 @@
 #include <string.h>
 #include <time.h>
 
+struct GlobalParams {
+	static uint8_t midiVoices;
+	static uint8_t currentLayer;
+	static uint8_t maxLayer;
+};
+uint8_t GlobalParams::midiVoices = 8;
+uint8_t GlobalParams::currentLayer = 0;
+uint8_t GlobalParams::maxLayer = 0;
+
+class Timer {
+	public:
+		Timer() {
+			set();
+		}
+
+		void set() {
+			clock_gettime(CLOCK_MONOTONIC, &setTime);
+		}
+
+		double get_s() {
+			struct timespec currentTime;
+			clock_gettime(CLOCK_MONOTONIC, &currentTime);
+			return currentTime.tv_sec - setTime.tv_sec + (currentTime.tv_nsec - setTime.tv_nsec) / 1000000000.0;
+		}
+
+		double get_ms() {
+			return get_s() * 1000.0;
+		}
+
+	private:
+		struct timespec setTime;
+};
+
 class I2CDevice {
 	public:
 		I2CDevice(int i2cFile) : i2cFile(i2cFile) {}
@@ -147,6 +180,19 @@ class GPIOExpander : public I2CDevice {
 				return false;
 			}
 			pinValues[(uint8_t) port] = states;
+			return true;
+		}
+
+		bool readPins(Port port, uint8_t *states) {
+			uint8_t addr = (port == GPIOExpander::Port::A ? 0x12 : 0x13);
+			if (write(i2cFile, &addr, 1) != 1) {
+				printf("Error: Failed to write to GPIO expander pin\n");
+				return false;
+			}
+			if (read(i2cFile, states, 1) != 1) {
+				printf("Error: Failed to read from GPIO expander pin\n");
+				return false;
+			}
 			return true;
 		}
 
@@ -406,9 +452,40 @@ class LCD {
 			}
 		}
 
+		// Display current layer
+		void writeDefault() {
+			if (GlobalParams::currentLayer == 0) {
+				writeStr("Layer: MIDI");
+			}
+			else {
+				char stringToWrite[10] = {0};
+				sprintf(stringToWrite, "Layer: %d", GlobalParams::currentLayer);
+				writeStr(stringToWrite);
+			}
+		}
+
+		void writeTimed(const char *str, double millis) {
+			writeStr(str);
+			isTimed = true;
+			messageTimer.set();
+			timerDelay_ms = millis;
+		}
+
+		void updateTiming() {
+			// Timed message has been shown for long enough, go back to default text
+			if (isTimed && messageTimer.get_ms() >= timerDelay_ms) {
+				clear();
+				writeDefault();
+				isTimed = false;
+			}
+		}
+
 	private:
 		DigitalOutputPin ePin, rsPin, rwPin, db4Pin, db5Pin, db6Pin, db7Pin;
-		
+		bool isTimed = false;
+		Timer messageTimer;
+		double timerDelay_ms = 0.0;
+
 		void pulseEnable() {
 			ePin.writeValue(0);
 			usleep(1);
@@ -508,76 +585,70 @@ class MIDIPacketQueue {
 		size_t length = 0;
 };
 
-class Timer {
-	public:
-		Timer() {
-			set();
-		}
-
-		void set() {
-			clock_gettime(CLOCK_MONOTONIC, &setTime);
-		}
-
-		double get_s() {
-			struct timespec currentTime;
-			clock_gettime(CLOCK_MONOTONIC, &currentTime);
-			return currentTime.tv_sec - setTime.tv_sec + (currentTime.tv_nsec - setTime.tv_nsec) / 1000000000.0;
-		}
-
-		double get_ms() {
-			return get_s() * 1000.0;
-		}
-
-	private:
-		struct timespec setTime;
-};
-
 class OutputManager {
-	public:
+	public:	
+		static const uint8_t NUM_CHANNELS = 8;
+
 		OutputManager(int i2cFile) : dac(i2cFile), gpio(i2cFile) {
-			gpio.open(0b0100010);
+			gpio.open(GPIO_EXPANDER_ADDR);
 			gpio.pinMode(GPIOExpander::Port::A, 0);  // Triggers
 			gpio.pinMode(GPIOExpander::Port::B, 0);  // Gates
+			pressedKeys = new uint8_t[PRESSED_KEYS_BUFFER_SIZE];
 		}	
 
 		void pressKey(uint8_t keyID) {
-			uint8_t channelToWrite = NUM_CHANNELS;
-			bool keyIDTaken = false;
-			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
-				if (!channels[i].gateIsOn && channelToWrite == NUM_CHANNELS) {
-					channelToWrite = i;
-				}
-				if (channels[i].gateIsOn && channels[i].keyID == keyID) {
-					keyIDTaken = true;
-					break;
-				}
-			}
-			if (keyIDTaken || channelToWrite == NUM_CHANNELS) {
+			if (!turnOnKey(keyID)) {
 				return;
 			}
-			
-			double outputVoltage = (keyID - 53) / 12.0;
-			uint16_t dacValue = (uint16_t) (outputVoltage / 5.0 * 4095);
-			
-			dac.open(DAC_ADDR);
-			dac.writeData(dacValue, DAC::Command::WRITE_UPDATE, channelToWrite);
-			
-			gpio.open(GPIO_EXPANDER_ADDR);
-			gpio.writePin(GPIOExpander::Port::A, channelToWrite, 1);
-			gpio.writePin(GPIOExpander::Port::B, channelToWrite, 1);
 
-			channels[channelToWrite].keyID = keyID;
-			channels[channelToWrite].gateIsOn = true;
-			channels[channelToWrite].triggerIsOn = true;
-			channels[channelToWrite].triggerTimer.set();
+			if (numPressedKeys >= pressedKeysCapacity) {
+				uint8_t *newPressedKeys = new uint8_t[pressedKeysCapacity + PRESSED_KEYS_BUFFER_SIZE];
+				memcpy(newPressedKeys, pressedKeys, pressedKeysCapacity);
+				pressedKeysCapacity += PRESSED_KEYS_BUFFER_SIZE;
+				delete[] pressedKeys;
+				pressedKeys = newPressedKeys;
+			}
+			pressedKeys[numPressedKeys] = keyID;
+			++numPressedKeys;
 		}
 
 		void releaseKey(uint8_t keyID) {
-			gpio.open(GPIO_EXPANDER_ADDR);
-			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
-				if (channels[i].gateIsOn && channels[i].keyID == keyID) {
-					gpio.writePin(GPIOExpander::Port::B, i, 0);
-					channels[i].gateIsOn = false;
+			turnOffKey(keyID);
+
+			if (numPressedKeys == 0) {
+				return;
+			}
+
+			bool keyFound = false;
+			for (size_t i = 0; i < numPressedKeys - 1; ++i) {
+				if (pressedKeys[i] == keyID) {
+					keyFound = true;
+				}
+				if (keyFound) {
+					// Shift key IDs down to fill released key's slot
+					pressedKeys[i] = pressedKeys[i + 1];
+				}
+			}
+			if (!keyFound && pressedKeys[numPressedKeys - 1] != keyID) {
+				return;
+			}
+
+			--numPressedKeys;
+
+			// Add back in last key that was replaced
+			if (numPressedKeys >= GlobalParams::midiVoices) {
+				for (size_t i = numPressedKeys - 1; i != static_cast<unsigned>(-1); --i) {
+					bool keyAlreadyOn = false;
+					for (uint8_t j = 0; j < NUM_CHANNELS; ++j) {
+						if (channels[j].keyID == pressedKeys[i] && channels[j].gateIsOn) {
+							keyAlreadyOn = true;
+							break;
+						}
+					}
+					if (!keyAlreadyOn) {
+						turnOnKey(pressedKeys[i]);
+						break;
+					}
 				}
 			}
 		}
@@ -592,6 +663,13 @@ class OutputManager {
 			}
 		}
 
+		// For when midiVoices changes, release unused channels
+		void cleanChannels() {
+			for (uint8_t i = GlobalParams::midiVoices; i < NUM_CHANNELS; ++i) {
+				//releaseKey(channels[i].keyID);
+			}
+		}
+
 	private:
 		struct OutputChannel {
 			uint8_t keyID = 0;
@@ -600,14 +678,183 @@ class OutputManager {
 			Timer triggerTimer;
 		};
 
-		static const uint8_t NUM_CHANNELS = 8;
 		static const uint8_t GPIO_EXPANDER_ADDR = 0b0100010;
 		static const uint8_t DAC_ADDR = 0b1001000;
+		static const uint8_t PRESSED_KEYS_BUFFER_SIZE = 4;
 
+		uint8_t *pressedKeys = nullptr;
+		size_t numPressedKeys = 0;
+		size_t pressedKeysCapacity = PRESSED_KEYS_BUFFER_SIZE;
 		OutputChannel channels[NUM_CHANNELS];
 		DAC dac;
 		GPIOExpander gpio;
+
+		bool turnOnKey(uint8_t keyID) {
+			uint8_t channelToWrite = NUM_CHANNELS;
+			bool keyIDTaken = false;
+			for (uint8_t i = 0; i < GlobalParams::midiVoices; ++i) {
+				if (!channels[i].gateIsOn && channelToWrite == NUM_CHANNELS) {
+					channelToWrite = i;
+				}
+				if (channels[i].gateIsOn && channels[i].keyID == keyID) {
+					keyIDTaken = true;
+					break;
+				}
+			}
+
+			// Prevent key double presses
+			if (keyIDTaken) {
+				return false;
+			}
+
+			// No open channel found, replace oldest key press
+			if (channelToWrite == NUM_CHANNELS) {
+				for (size_t i = 0; i < numPressedKeys; ++i) {
+					for (uint8_t j = 0; j < GlobalParams::midiVoices; ++j) {
+						if (channels[j].keyID == pressedKeys[i]) {
+							turnOffKey(pressedKeys[i]);
+							channelToWrite = j;
+							goto keyReplacementFound;
+						}
+					}
+				}
+				return false;
+			}	
+
+// Exit above two for loops
+keyReplacementFound:
+			double outputVoltage = (keyID - 53) / 12.0;
+			uint16_t dacValue = (uint16_t) (outputVoltage / 5.0 * 4095);
+			
+			dac.open(DAC_ADDR);
+			dac.writeData(dacValue, DAC::Command::WRITE_UPDATE, channelToWrite);
+			
+			gpio.open(GPIO_EXPANDER_ADDR);
+			gpio.writePin(GPIOExpander::Port::A, channelToWrite, 1);
+			gpio.writePin(GPIOExpander::Port::B, channelToWrite, 1);
+
+			channels[channelToWrite].keyID = keyID;
+			channels[channelToWrite].gateIsOn = true;
+			channels[channelToWrite].triggerIsOn = true;
+			channels[channelToWrite].triggerTimer.set();
+
+			return true;
+		}
+
+		void turnOffKey(uint8_t keyID) {
+			gpio.open(GPIO_EXPANDER_ADDR);
+			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
+				if (channels[i].gateIsOn && channels[i].keyID == keyID) {
+					gpio.writePin(GPIOExpander::Port::B, i, 0);
+					channels[i].gateIsOn = false;
+				}
+			}
+		}
 };	
+
+class DebouncedButton {
+	public:
+		DebouncedButton(uint8_t pin) : buttonPin(pin) {
+			buttonPin.setup();
+		}
+		bool wasClicked() {
+			bool currentValue = 0;
+			buttonPin.readValue(&currentValue);
+			if (currentValue && !prevValue && !timerWasSet) {
+				debounceTimer.set();
+				timerWasSet = true;
+			}
+			if (timerWasSet && debounceTimer.get_ms() >= 20.0) {
+				timerWasSet = false;
+				if (currentValue) {
+					return true;
+				}
+			}
+			prevValue = currentValue;
+			return false;
+		}
+
+	private:
+		DigitalInputPin buttonPin;
+		bool prevValue = 0;
+		Timer debounceTimer;
+		bool timerWasSet = false;
+};
+
+class Sequencer {
+	public:
+		Sequencer(int i2cFile) : ledGPIO(i2cFile), buttonGPIO(i2cFile) {
+			ledGPIO.open(0b0100001);
+			ledGPIO.pinMode(GPIOExpander::Port::A, 0);
+			ledGPIO.pinMode(GPIOExpander::Port::B, 0);
+
+			//ledGPIO.writePin(GPIOExpander::Port::A, 0, 1);
+			//ledGPIO.writePin(GPIOExpander::Port::A, 5, 1);
+			//ledGPIO.writePin(GPIOExpander::Port::B, 3, 1);
+		}
+
+		void updateLayerCount() {
+			uint8_t totalVoicesUsed = GlobalParams::midiVoices;
+			GlobalParams::maxLayer = 0;
+			for (uint8_t i = 0; i < MAX_LAYERS; ++i) {
+				if (totalVoicesUsed >= OutputManager::NUM_CHANNELS) {
+					break;
+				}
+				totalVoicesUsed += layers[i].voicesUsed;
+				if (totalVoicesUsed > OutputManager::NUM_CHANNELS) {
+					layers[i].voicesUsed -= (totalVoicesUsed - OutputManager::NUM_CHANNELS);
+				}
+				++GlobalParams::maxLayer;
+			}
+		}
+
+		void updateLEDs() {
+			ledGPIO.open(LED_GPIO_ADDR);
+			for (uint8_t i = 0; i < NUM_STEPS; ++i) {
+				if (i == selectedStep) {
+
+				}
+			}
+		}
+		
+		void updateSelection() {
+			buttonGPIO.open(BUTTON_GPIO_ADDR);
+			uint8_t buttonStatesA = 0;
+			uint8_t buttonStatesB = 0;
+			buttonGPIO.readPins(GPIOExpander::Port::A, &buttonStatesA);
+			buttonGPIO.readPins(GPIOExpander::Port::B, &buttonStatesB);
+			printf("A: %d    B: %d\n", buttonStatesA, buttonStatesB);
+		}
+
+	private:
+		static const uint8_t MAX_LAYERS = 8;
+		static const uint8_t NUM_STEPS = 16;
+		static const uint8_t LED_GPIO_ADDR = 0b0100001;
+		static const uint8_t BUTTON_GPIO_ADDR = 0b0100000;
+
+		struct Step {
+			static const uint8_t REST_ID = 128;
+			static const uint8_t RESET_ID = 129;
+			uint8_t noteIDs[OutputManager::NUM_CHANNELS];
+
+			Step() {
+				for (uint8_t i = 0; i < OutputManager::NUM_CHANNELS; ++i) {
+					noteIDs[i] = RESET_ID;
+				}
+			}
+		};
+
+		struct Layer {
+			uint8_t voicesUsed = 1;
+			Step steps[NUM_STEPS];
+		};
+		
+		Layer layers[MAX_LAYERS];
+		GPIOExpander ledGPIO;
+		GPIOExpander buttonGPIO;
+		uint8_t selectedStep = NUM_STEPS;
+		Timer selectBlinkTimer;
+};
 
 MIDIPacketQueue midiQueue;
 pthread_t midiThread;
@@ -656,10 +903,12 @@ int main() {
 	}
 	
 	OutputManager outputManager(i2cFile);
-	
+	Sequencer sequencer(i2cFile);
+
 	LCD lcd(12, 13, 4, 5, 6, 7);
 	lcd.setup();
 	lcd.writeStr("Welcome!");
+	usleep(2000000);
 
 	midiInit();
 
@@ -668,7 +917,56 @@ int main() {
 	Timer restTimer;
 	bool restValue = 0;
 
+	DebouncedButton modeButton(17);
+	DebouncedButton layerDecreaseButton(27);
+	DebouncedButton layerIncreaseButton(22);
+
+	lcd.clear();
+	lcd.writeDefault();
+
 	while (true) {
+		// Change mode (number of MIDI voices for MIDI layer or playing type for seq layer)
+		if (modeButton.wasClicked()) {
+			if (GlobalParams::currentLayer == 0) {
+				++GlobalParams::midiVoices;
+				if (GlobalParams::midiVoices > 8) {
+					GlobalParams::midiVoices = 0;
+				}
+				
+				outputManager.cleanChannels();
+
+				char textToDisplay[16] = {0};
+				sprintf(textToDisplay, "MIDI Voices: %d", GlobalParams::midiVoices);
+
+				lcd.clear();
+				lcd.writeTimed(textToDisplay, 1000);
+
+				sequencer.updateLayerCount();
+			}
+		}
+
+		// Change layer (where layer 0 means MIDI layer)
+		if (layerDecreaseButton.wasClicked()) {
+			if (GlobalParams::currentLayer == 0) {
+				GlobalParams::currentLayer = GlobalParams::maxLayer;
+			}
+			else {
+				--GlobalParams::currentLayer;
+			}
+			lcd.clear();
+			lcd.writeDefault();
+		}
+		else if (layerIncreaseButton.wasClicked()) {
+			if (GlobalParams::currentLayer >= GlobalParams::maxLayer) {
+				GlobalParams::currentLayer = 0;
+			}
+			else {
+				++GlobalParams::currentLayer;
+			}
+			lcd.clear();
+			lcd.writeDefault();
+		}
+
 		pthread_mutex_lock(&midiLock);
 		for (size_t i = 0; i < midiQueue.getLength(); ++i) {
 			const uint8_t *packet = midiQueue.getPacket(i);
@@ -683,6 +981,9 @@ int main() {
 		pthread_mutex_unlock(&midiLock);
 
 		outputManager.updateTriggers();
+		lcd.updateTiming();
+		sequencer.updateLEDs();
+		sequencer.updateSelection();
 
 		restPin.readValue(&restValue);
 		if (restValue) {
