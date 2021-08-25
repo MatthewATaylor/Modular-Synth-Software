@@ -183,6 +183,16 @@ class GPIOExpander : public I2CDevice {
 			return true;
 		}
 
+		bool readPin(Port port, uint8_t pinNum, bool *state) {
+			uint8_t states;
+			if (!readPins(port, &states)) {
+				printf("Error: Failed to read from GPIO expander pin\n");
+				return false;
+			}
+			*state = (states >> pinNum) & 1;
+			return true;
+		}
+
 		bool readPins(Port port, uint8_t *states) {
 			uint8_t addr = (port == GPIOExpander::Port::A ? 0x12 : 0x13);
 			if (write(i2cFile, &addr, 1) != 1) {
@@ -196,8 +206,39 @@ class GPIOExpander : public I2CDevice {
 			return true;
 		}
 
+	protected:
+		static const uint8_t NUM_PORTS = 2;
+		static const uint8_t PINS_PER_PORT = 8;
+
+		uint8_t pinValues[NUM_PORTS] = {0b00000000, 0b00000000};
+};
+
+class DebouncedGPIOExpander : public GPIOExpander {
+	public:
+		DebouncedGPIOExpander(int i2cFile) : GPIOExpander(i2cFile) {}
+		DebouncedGPIOExpander() {}
+
+		bool pinWasClicked(Port port, uint8_t pinNum) {
+			bool currentValue = 0;
+			readPin(port, pinNum, &currentValue);
+			if (currentValue && !prevValues[(int) port][pinNum] && !debounceTimerWasSet[(int) port][pinNum]) {
+				debounceTimers[(int) port][pinNum].set();
+				debounceTimerWasSet[(int) port][pinNum] = true;
+			}
+			if (debounceTimerWasSet[(int) port][pinNum] && debounceTimers[(int) port][pinNum].get_ms() >= 20.0) {
+				debounceTimerWasSet[(int) port][pinNum] = false;
+				if (currentValue) {
+					return true;
+				}
+			}
+			prevValues[(int) port][pinNum] = currentValue;
+			return false;
+		}
+
 	private:
-		uint8_t pinValues[2] = {0b00000000, 0b00000000};
+		bool prevValues[NUM_PORTS][PINS_PER_PORT] = {0};
+		Timer debounceTimers[NUM_PORTS][PINS_PER_PORT];
+		bool debounceTimerWasSet[NUM_PORTS][PINS_PER_PORT] = {0};
 };
 
 class GPIOPin {
@@ -810,20 +851,47 @@ class Sequencer {
 
 		void updateLEDs() {
 			ledGPIO.open(LED_GPIO_ADDR);
-			for (uint8_t i = 0; i < NUM_STEPS; ++i) {
-				if (i == selectedStep) {
-
+			if (GlobalParams::currentLayer == 0) {
+				// LEDs off in MIDI layer
+				ledGPIO.writePins(GPIOExpander::Port::A, 0);
+				ledGPIO.writePins(GPIOExpander::Port::B, 0);
+			}
+			else {
+				for (uint8_t i = 0; i < NUM_STEPS; ++i) {
+					GPIOExpander::Port port = i < 8 ? GPIOExpander::Port::B : GPIOExpander::Port::A;
+					uint8_t pinNum = i % 8;
+					if (i == selectedStep) {
+						if (selectBlinkTimer.get_ms() >= 100) {
+							selectBlinkTimer.set();
+							selectBlinkIsOn = !selectBlinkIsOn;
+						}
+						ledGPIO.writePin(port, pinNum, selectBlinkIsOn);
+					}
 				}
 			}
 		}
 		
 		void updateSelection() {
 			buttonGPIO.open(BUTTON_GPIO_ADDR);
-			uint8_t buttonStatesA = 0;
-			uint8_t buttonStatesB = 0;
-			buttonGPIO.readPins(GPIOExpander::Port::A, &buttonStatesA);
-			buttonGPIO.readPins(GPIOExpander::Port::B, &buttonStatesB);
-			printf("A: %d    B: %d\n", buttonStatesA, buttonStatesB);
+			GPIOExpander::Port port = GPIOExpander::Port::B;
+			for (uint8_t i = 0; i < NUM_STEPS; ++i) {
+				if (i == 8) {
+					port = GPIOExpander::Port::A;
+				}
+				uint8_t pinNum = i % 8;
+				if (buttonGPIO.pinWasClicked(port, pinNum) && GlobalParams::currentLayer != 0) {
+					ledGPIO.open(LED_GPIO_ADDR);
+					GPIOExpander::Port port = selectedStep < 8 ? GPIOExpander::Port::B : GPIOExpander::Port::A;
+					ledGPIO.writePin(port, selectedStep % 8, 0);	
+					if (i == selectedStep) {
+						// Deselect current step
+						selectedStep = NUM_STEPS;
+					}
+					else {
+						selectedStep = i;
+					}
+				}
+			}
 		}
 
 	private:
@@ -851,9 +919,10 @@ class Sequencer {
 		
 		Layer layers[MAX_LAYERS];
 		GPIOExpander ledGPIO;
-		GPIOExpander buttonGPIO;
+		DebouncedGPIOExpander buttonGPIO;
 		uint8_t selectedStep = NUM_STEPS;
 		Timer selectBlinkTimer;
+		bool selectBlinkIsOn = false;
 };
 
 MIDIPacketQueue midiQueue;
