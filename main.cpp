@@ -717,7 +717,10 @@ class OutputManager {
 
 	private:
 		struct OutputChannel {
-			uint8_t keyID = 0;
+			static const uint8_t SEQUENCED_KEY_ID = 128;
+
+			uint8_t keyID = 0;  // 0-127 for MIDI, 128 for sequenced
+			uint8_t pitchID = 0;  // 0-127
 			bool gateIsOn = false;
 			bool triggerIsOn = false;
 			Timer triggerTimer;
@@ -734,7 +737,7 @@ class OutputManager {
 		DAC dac;
 		GPIOExpander gpio;
 
-		bool turnOnKey(uint8_t keyID) {
+		bool turnOnKey(uint8_t keyID, bool sequenced = false) {
 			uint8_t channelToWrite = NUM_CHANNELS;
 			bool keyIDTaken = false;
 			for (uint8_t i = 0; i < GlobalParams::midiVoices; ++i) {
@@ -828,14 +831,10 @@ class DebouncedButton {
 
 class Sequencer {
 	public:
-		Sequencer(int i2cFile) : ledGPIO(i2cFile), buttonGPIO(i2cFile) {
+		Sequencer(int i2cFile, OutputManager *outputManager) : ledGPIO(i2cFile), buttonGPIO(i2cFile), outputManager(outputManager) {
 			ledGPIO.open(0b0100001);
 			ledGPIO.pinMode(GPIOExpander::Port::A, 0);
 			ledGPIO.pinMode(GPIOExpander::Port::B, 0);
-
-			//ledGPIO.writePin(GPIOExpander::Port::A, 0, 1);
-			//ledGPIO.writePin(GPIOExpander::Port::A, 5, 1);
-			//ledGPIO.writePin(GPIOExpander::Port::B, 3, 1);
 		}
 
 		void updateLayerCount() {
@@ -898,6 +897,40 @@ class Sequencer {
 			}
 		}
 
+		bool isAcceptingInput() {
+			return selectedStep != NUM_STEPS;
+		}
+		
+		void pressKey(uint8_t keyID) {
+
+		}
+
+		void releaseKey(uint8_t keyID) {
+		
+		}
+
+		void play() {
+			bool shouldAdvanceStep = false;
+			double secondsPerBeat = 60.0 / GlobalParams::bpm;
+			if (stepTimer.get_s() >= secondsPerBeat) {
+				shouldAdvanceStep = true;
+				stepTimer.set();
+			}
+			for (uint8_t i = 0; i < GlobalParams::maxLayer; ++i) {
+				if (shouldAdvanceStep) {
+					++layers[i].currentStep;
+					if (layers[i].currentStep == NUM_STEPS) {
+						layers[i].currentStep = 0;
+					}
+					else if (layers[i].steps[layers[i].currentStep].noteIDs[0] == Step::RESET_ID) {
+						layers[i].currentStep = 0;
+					}
+
+					uint8_t *noteIDs = layers[i].steps[layers[i].currentStep].noteIDs;
+				}
+			}
+		}
+
 	private:
 		static const uint8_t MAX_LAYERS = 8;
 		static const uint8_t NUM_STEPS = 16;
@@ -919,14 +952,20 @@ class Sequencer {
 		struct Layer {
 			uint8_t voicesUsed = 1;
 			Step steps[NUM_STEPS];
+			uint8_t currentStep = 0;
 		};
+
+		OutputManager *outputManager = nullptr;
 		
 		Layer layers[MAX_LAYERS];
 		GPIOExpander ledGPIO;
 		DebouncedGPIOExpander buttonGPIO;
+		
 		uint8_t selectedStep = NUM_STEPS;
 		Timer selectBlinkTimer;
 		bool selectBlinkIsOn = false;
+
+		Timer stepTimer;
 };
 
 MIDIPacketQueue midiQueue;
@@ -976,7 +1015,7 @@ int main() {
 	}
 
 	OutputManager outputManager(i2cFile);
-	Sequencer sequencer(i2cFile);
+	Sequencer sequencer(i2cFile, &outputManager);
 
 	ADC rateADC(i2cFile);
 
@@ -1043,14 +1082,25 @@ int main() {
 			lcd.writeDefault();
 		}
 
+		// MIDI input
 		pthread_mutex_lock(&midiLock);
-		for (size_t i = 0; i < midiQueue.getLength(); ++i) {
+		for (size_t i = 0; i < midiQueue.getLength(); ++i) {			
 			const uint8_t *packet = midiQueue.getPacket(i);
 			if (packet[0] == 144) {
-				outputManager.pressKey(packet[1]);
+				if (sequencer.isAcceptingInput()) {
+					sequencer.pressKey(packet[1]);
+				}
+				else {
+					outputManager.pressKey(packet[1]);
+				}
 			}
 			else if (packet[0] == 128) {
-				outputManager.releaseKey(packet[1]);
+				if (sequencer.isAcceptingInput()) {
+					sequencer.releaseKey(packet[1]);
+				}
+				else {
+					outputManager.releaseKey(packet[1]);
+				}
 			}
 		}
 		midiQueue.clear();
@@ -1060,7 +1110,9 @@ int main() {
 		lcd.updateTiming();
 		sequencer.updateLEDs();
 		sequencer.updateSelection();
+		sequencer.play();
 
+		// BPM
 		rateADC.open(ADC_ADDR);
 		uint16_t adcValue;
 		rateADC.readData(&adcValue);
@@ -1074,7 +1126,7 @@ int main() {
 		}
 		prevBPM = GlobalParams::bpm;
 
-
+		// Exit
 		restPin.readValue(&restValue);
 		if (restValue) {
 			if (restTimer.get_s() > 3.0) {
