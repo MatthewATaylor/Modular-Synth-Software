@@ -1,5 +1,6 @@
 #include <sys/soundcard.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <linux/i2c-dev.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -9,6 +10,7 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
 
 struct GlobalParams {
 	static uint8_t midiVoices;
@@ -885,25 +887,35 @@ class Sequencer {
 				ledGPIO.writePins(GPIOExpander::Port::B, 0);
 			}
 			else {
+				GPIOExpander::Port port = GPIOExpander::Port::B;
+				uint8_t states = 0;
 				for (uint8_t i = 0; i < NUM_STEPS; ++i) {
-					GPIOExpander::Port port = i < 8 ? GPIOExpander::Port::B : GPIOExpander::Port::A;
-					uint8_t pinNum = i % 8;
+					bool state = 0;
+
 					if (i == selectedStep) {
 						if (selectBlinkTimer.get_ms() >= 100) {
 							selectBlinkTimer.set();
 							selectBlinkIsOn = !selectBlinkIsOn;
 						}
-						ledGPIO.writePin(port, pinNum, selectBlinkIsOn);
+						state = selectBlinkIsOn;
 					}
 					else {
 						uint8_t *noteIDs = layers[GlobalParams::currentLayer - 1].steps[i].noteIDs;
 						if (noteIDs[0] == Step::RESET_ID || i == layers[GlobalParams::currentLayer - 1].currentStep) {
 							// Off for reset or current step
-							ledGPIO.writePin(port, pinNum, 0);
+							state = 0;
 						}
 						else {
-							ledGPIO.writePin(port, pinNum, 1);
+							state = 1;
 						}
+					}
+
+					states += (state << (i % 8));
+
+					if (i == 7 || i == NUM_STEPS - 1) {
+						ledGPIO.writePins(port, states);
+						port = GPIOExpander::Port::A;
+						states = 0;
 					}
 				}
 			}
@@ -911,26 +923,25 @@ class Sequencer {
 		
 		void updateSelection() {
 			buttonGPIO.open(BUTTON_GPIO_ADDR);
-			GPIOExpander::Port port = GPIOExpander::Port::B;
+			
+			uint8_t statesA;
+			buttonGPIO.readPins(GPIOExpander::Port::A, &statesA);
+			uint8_t statesB;
+			buttonGPIO.readPins(GPIOExpander::Port::B, &statesB);
+
+			uint8_t statesToRead = statesB;
 			for (uint8_t i = 0; i < NUM_STEPS; ++i) {
 				if (i == 8) {
-					port = GPIOExpander::Port::A;
+					statesToRead = statesA;
 				}
-				uint8_t pinNum = i % 8;
-				if (buttonGPIO.pinWasClicked(port, pinNum) && GlobalParams::currentLayer != 0) {
-					ledGPIO.open(LED_GPIO_ADDR);
-					GPIOExpander::Port port = selectedStep < 8 ? GPIOExpander::Port::B : GPIOExpander::Port::A;
-					ledGPIO.writePin(port, selectedStep % 8, 0);	
-					if (i == selectedStep) {
-						// Deselect current step
-						selectedStep = NUM_STEPS;
-					}
-					else {
-						selectedStep = i;
-						outputManager->cleanChannels(0, GlobalParams::midiVoices);
-					}
+				bool state = (statesToRead >> (i % 8)) & 1;
+				if (state) {
+					selectedStep = i;
+					outputManager->cleanChannels(0, GlobalParams::midiVoices);
+					return;
 				}
 			}
+			selectedStep = NUM_STEPS;
 		}
 
 		bool isAcceptingInput() {
@@ -986,42 +997,6 @@ class Sequencer {
 				}
 			}
 		}
-
-		/*
-		void advanceStep() {
-			currentStepTurnedOff = false;
-			for (uint8_t i = 0; i < GlobalParams::maxLayer; ++i) {
-				++layers[i].currentStep;
-				if (layers[i].currentStep == NUM_STEPS) {
-					layers[i].currentStep = 0;
-				}
-				else if (layers[i].steps[layers[i].currentStep].noteIDs[0] == Step::RESET_ID) {
-					layers[i].currentStep = 0;
-				}
-
-				uint8_t *noteIDs = layers[i].steps[layers[i].currentStep].noteIDs;
-				if (noteIDs[0] != Step::REST_ID) {
-					for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
-						if (noteIDs[j] == Step::RESET_ID) {
-						       break;
-						}	       
-						outputManager->turnOnChannel(layers[i].startChannel + j, noteIDs[j]);
-					}
-				}
-			}
-		}
-
-		void turnOffStep() {
-			if (!currentStepTurnedOff) {
-				for (uint8_t i = 0; i < GlobalParams::maxLayer; ++i) {
-					for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
-						outputManager->turnOffChannel(layers[i].startChannel + j);
-					}
-				}
-				currentStepTurnedOff = true;
-			}
-		}
-		*/
 
 	private:
 		static const uint8_t MAX_LAYERS = 8;
@@ -1211,7 +1186,7 @@ int main() {
 		rateADC.open(ADC_ADDR);
 		uint16_t adcValue;	
 		rateADC.readData(&adcValue);
-		double bpm = 270 * rateADC.getPotPosition(adcValue + 1) + 30;
+		double bpm = 250 * rateADC.getPotPosition(adcValue + 1) + 50;
 		GlobalParams::bpm = (uint16_t) bpm;
 		if (prevBPM != 0 && prevBPM != GlobalParams::bpm) {
 			char textToDisplay[10] = {0};
