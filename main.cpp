@@ -109,19 +109,29 @@ class ADC : public I2CDevice {
 		}
 
 		static double getVoltage(uint16_t value) {
-			return value / 2047.0 * 2.048;
+			return value / (double) MAX_VALUE * 2.048;
+		}
+
+		// Fill valueToPotPosition array with precalculated values
+		static void calculatePotPositions() {
+			for (uint16_t i = 1; i < MAX_VALUE; ++i) {
+				double v = getVoltage(i);
+				valueToPotPosition[i] = (500 * v - 33 + sqrt(290000 * v * v - 33000 * v + 1089)) / (1000.0 * v);
+			}
 		}
 
 		/*
-		 * Get pot position (0 to 1) given ADC reading, needed because of voltage divider on pot output
+		 * Get pot position (0 to 1) given ADC reading using precalculated values
 		 */
 		static double getPotPosition(uint16_t value) {
-			double v = getVoltage(value);
-
-			// Equation represents the inverse of the circuit's transfer function
-			return (500 * v - 33 + sqrt(290000 * v * v - 33000 * v + 1089)) / (1000.0 * v);
+			return valueToPotPosition[value];
 		}
+
+	private:
+		static const uint16_t MAX_VALUE = 2047;
+		static double valueToPotPosition[MAX_VALUE];
 };
+double ADC::valueToPotPosition[ADC::MAX_VALUE] = {0.0};
 
 class GPIOExpander : public I2CDevice {
 	public:
@@ -659,32 +669,15 @@ class OutputManager {
 
 		void releaseKey(uint8_t keyID) {
 			turnOffKey(keyID);
-
-			if (numPressedKeys == 0) {
+			if (!removePressedKey(keyID)) {
 				return;
 			}
-
-			bool keyFound = false;
-			for (size_t i = 0; i < numPressedKeys - 1; ++i) {
-				if (pressedKeys[i] == keyID) {
-					keyFound = true;
-				}
-				if (keyFound) {
-					// Shift key IDs down to fill released key's slot
-					pressedKeys[i] = pressedKeys[i + 1];
-				}
-			}
-			if (!keyFound && pressedKeys[numPressedKeys - 1] != keyID) {
-				return;
-			}
-
-			--numPressedKeys;
 
 			// Add back in last key that was replaced
 			if (numPressedKeys >= GlobalParams::midiVoices) {
 				for (size_t i = numPressedKeys - 1; i != static_cast<unsigned>(-1); --i) {
 					bool keyAlreadyOn = false;
-					for (uint8_t j = 0; j < NUM_CHANNELS; ++j) {
+					for (uint8_t j = 0; j < GlobalParams::midiVoices; ++j) {
 						if (channels[j].keyID == pressedKeys[i] && channels[j].gateIsOn) {
 							keyAlreadyOn = true;
 							break;
@@ -708,19 +701,40 @@ class OutputManager {
 			}
 		}
 
-		// For when midiVoices changes, release unused channels
-		void cleanChannels() {
-			for (uint8_t i = GlobalParams::midiVoices; i < NUM_CHANNELS; ++i) {
-				//releaseKey(channels[i].keyID);
+		// For when midiVoices changes or when setting sequences, release unused channels
+		void cleanChannels(uint8_t startChannel, uint8_t endChannel) {
+			for (uint8_t i = startChannel; i < endChannel; ++i) {
+				removePressedKey(channels[i].keyID);
+				turnOffChannel(i);
 			}
+		}
+
+		void turnOnChannel(uint8_t channel, uint8_t keyID) {
+			double outputVoltage = (keyID - 53) / 12.0;
+			uint16_t dacValue = (uint16_t) (outputVoltage / 5.0 * 4095);
+			
+			dac.open(DAC_ADDR);
+			dac.writeData(dacValue, DAC::Command::WRITE_UPDATE, channel);
+			
+			gpio.open(GPIO_EXPANDER_ADDR);
+			gpio.writePin(GPIOExpander::Port::A, channel, 1);
+			gpio.writePin(GPIOExpander::Port::B, channel, 1);
+
+			channels[channel].keyID = keyID;
+			channels[channel].gateIsOn = true;
+			channels[channel].triggerIsOn = true;
+			channels[channel].triggerTimer.set();
+		}
+
+		void turnOffChannel(uint8_t channel) {
+			gpio.open(GPIO_EXPANDER_ADDR);
+			gpio.writePin(GPIOExpander::Port::B, channel, 0);
+			channels[channel].gateIsOn = false;
 		}
 
 	private:
 		struct OutputChannel {
-			static const uint8_t SEQUENCED_KEY_ID = 128;
-
-			uint8_t keyID = 0;  // 0-127 for MIDI, 128 for sequenced
-			uint8_t pitchID = 0;  // 0-127
+			uint8_t keyID = 0;  // 0-127
 			bool gateIsOn = false;
 			bool triggerIsOn = false;
 			Timer triggerTimer;
@@ -737,7 +751,7 @@ class OutputManager {
 		DAC dac;
 		GPIOExpander gpio;
 
-		bool turnOnKey(uint8_t keyID, bool sequenced = false) {
+		bool turnOnKey(uint8_t keyID) {
 			uint8_t channelToWrite = NUM_CHANNELS;
 			bool keyIDTaken = false;
 			for (uint8_t i = 0; i < GlobalParams::midiVoices; ++i) {
@@ -771,32 +785,41 @@ class OutputManager {
 
 // Exit above two for loops
 keyReplacementFound:
-			double outputVoltage = (keyID - 53) / 12.0;
-			uint16_t dacValue = (uint16_t) (outputVoltage / 5.0 * 4095);
-			
-			dac.open(DAC_ADDR);
-			dac.writeData(dacValue, DAC::Command::WRITE_UPDATE, channelToWrite);
-			
-			gpio.open(GPIO_EXPANDER_ADDR);
-			gpio.writePin(GPIOExpander::Port::A, channelToWrite, 1);
-			gpio.writePin(GPIOExpander::Port::B, channelToWrite, 1);
-
-			channels[channelToWrite].keyID = keyID;
-			channels[channelToWrite].gateIsOn = true;
-			channels[channelToWrite].triggerIsOn = true;
-			channels[channelToWrite].triggerTimer.set();
-
+			turnOnChannel(channelToWrite, keyID);
 			return true;
 		}
 
 		void turnOffKey(uint8_t keyID) {
 			gpio.open(GPIO_EXPANDER_ADDR);
-			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
+			for (uint8_t i = 0; i < GlobalParams::midiVoices; ++i) {
 				if (channels[i].gateIsOn && channels[i].keyID == keyID) {
 					gpio.writePin(GPIOExpander::Port::B, i, 0);
 					channels[i].gateIsOn = false;
 				}
 			}
+		}
+
+		bool removePressedKey(uint8_t keyID) {
+			if (numPressedKeys == 0) {
+				return false;
+			}
+
+			bool keyFound = false;
+			for (size_t i = 0; i < numPressedKeys - 1; ++i) {
+				if (pressedKeys[i] == keyID) {
+					keyFound = true;
+				}
+				if (keyFound) {
+					// Shift key IDs down to fill released key's slot
+					pressedKeys[i] = pressedKeys[i + 1];
+				}
+			}
+			if (!keyFound && pressedKeys[numPressedKeys - 1] != keyID) {
+				return false;
+			}
+
+			--numPressedKeys;
+			return true;
 		}
 };	
 
@@ -837,13 +860,15 @@ class Sequencer {
 			ledGPIO.pinMode(GPIOExpander::Port::B, 0);
 		}
 
-		void updateLayerCount() {
+		// Update number of sequencer layers and channels used by those layers
+		void updateLayerLayout() {
 			uint8_t totalVoicesUsed = GlobalParams::midiVoices;
 			GlobalParams::maxLayer = 0;
 			for (uint8_t i = 0; i < MAX_LAYERS; ++i) {
 				if (totalVoicesUsed >= OutputManager::NUM_CHANNELS) {
 					break;
 				}
+				layers[i].startChannel = totalVoicesUsed;
 				totalVoicesUsed += layers[i].voicesUsed;
 				if (totalVoicesUsed > OutputManager::NUM_CHANNELS) {
 					layers[i].voicesUsed -= (totalVoicesUsed - OutputManager::NUM_CHANNELS);
@@ -870,6 +895,16 @@ class Sequencer {
 						}
 						ledGPIO.writePin(port, pinNum, selectBlinkIsOn);
 					}
+					else {
+						uint8_t *noteIDs = layers[GlobalParams::currentLayer - 1].steps[i].noteIDs;
+						if (noteIDs[0] == Step::RESET_ID || i == layers[GlobalParams::currentLayer - 1].currentStep) {
+							// Off for reset or current step
+							ledGPIO.writePin(port, pinNum, 0);
+						}
+						else {
+							ledGPIO.writePin(port, pinNum, 1);
+						}
+					}
 				}
 			}
 		}
@@ -892,29 +927,37 @@ class Sequencer {
 					}
 					else {
 						selectedStep = i;
+						outputManager->cleanChannels(0, GlobalParams::midiVoices);
 					}
 				}
 			}
 		}
 
 		bool isAcceptingInput() {
-			return selectedStep != NUM_STEPS;
+			return selectedStep != NUM_STEPS && GlobalParams::currentLayer != 0;
 		}
 		
 		void pressKey(uint8_t keyID) {
-
+			layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[0] = keyID;
 		}
 
 		void releaseKey(uint8_t keyID) {
-		
+			
 		}
 
 		void play() {
 			bool shouldAdvanceStep = false;
-			double secondsPerBeat = 60.0 / GlobalParams::bpm;
-			if (stepTimer.get_s() >= secondsPerBeat) {
+			bool shouldTurnOffStep = false;
+			double secondsPerBeat = 60.0 / GlobalParams::bpm / 4.0;
+			double elapsedSeconds = stepTimer.get_s();
+			if (elapsedSeconds >= secondsPerBeat) {	
 				shouldAdvanceStep = true;
 				stepTimer.set();
+				currentStepTurnedOff = false;
+			}
+			else if (elapsedSeconds >= secondsPerBeat / 2.0 && !currentStepTurnedOff) {
+				shouldTurnOffStep = true;
+				currentStepTurnedOff = true;
 			}
 			for (uint8_t i = 0; i < GlobalParams::maxLayer; ++i) {
 				if (shouldAdvanceStep) {
@@ -927,9 +970,58 @@ class Sequencer {
 					}
 
 					uint8_t *noteIDs = layers[i].steps[layers[i].currentStep].noteIDs;
+					if (noteIDs[0] != Step::REST_ID) {
+						for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
+							if (noteIDs[j] == Step::RESET_ID) {
+							       break;
+							}	       
+							outputManager->turnOnChannel(layers[i].startChannel + j, noteIDs[j]);
+						}
+					}
+				}
+				else if (shouldTurnOffStep) {
+					for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
+						outputManager->turnOffChannel(layers[i].startChannel + j);
+					}
 				}
 			}
 		}
+
+		/*
+		void advanceStep() {
+			currentStepTurnedOff = false;
+			for (uint8_t i = 0; i < GlobalParams::maxLayer; ++i) {
+				++layers[i].currentStep;
+				if (layers[i].currentStep == NUM_STEPS) {
+					layers[i].currentStep = 0;
+				}
+				else if (layers[i].steps[layers[i].currentStep].noteIDs[0] == Step::RESET_ID) {
+					layers[i].currentStep = 0;
+				}
+
+				uint8_t *noteIDs = layers[i].steps[layers[i].currentStep].noteIDs;
+				if (noteIDs[0] != Step::REST_ID) {
+					for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
+						if (noteIDs[j] == Step::RESET_ID) {
+						       break;
+						}	       
+						outputManager->turnOnChannel(layers[i].startChannel + j, noteIDs[j]);
+					}
+				}
+			}
+		}
+
+		void turnOffStep() {
+			if (!currentStepTurnedOff) {
+				for (uint8_t i = 0; i < GlobalParams::maxLayer; ++i) {
+					for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
+						outputManager->turnOffChannel(layers[i].startChannel + j);
+					}
+				}
+				currentStepTurnedOff = true;
+			}
+		}
+		*/
 
 	private:
 		static const uint8_t MAX_LAYERS = 8;
@@ -951,6 +1043,7 @@ class Sequencer {
 
 		struct Layer {
 			uint8_t voicesUsed = 1;
+			uint8_t startChannel = 0;
 			Step steps[NUM_STEPS];
 			uint8_t currentStep = 0;
 		};
@@ -966,6 +1059,7 @@ class Sequencer {
 		bool selectBlinkIsOn = false;
 
 		Timer stepTimer;
+		bool currentStepTurnedOff = false;
 };
 
 MIDIPacketQueue midiQueue;
@@ -1018,6 +1112,7 @@ int main() {
 	Sequencer sequencer(i2cFile, &outputManager);
 
 	ADC rateADC(i2cFile);
+	ADC::calculatePotPositions();
 
 	LCD lcd(12, 13, 4, 5, 6, 7);
 	lcd.setup();
@@ -1044,11 +1139,13 @@ int main() {
 		if (modeButton.wasClicked()) {
 			if (GlobalParams::currentLayer == 0) {
 				++GlobalParams::midiVoices;
-				if (GlobalParams::midiVoices > 8) {
+				if (GlobalParams::midiVoices > OutputManager::NUM_CHANNELS) {
 					GlobalParams::midiVoices = 0;
+					outputManager.cleanChannels(0, OutputManager::NUM_CHANNELS);
 				}
-				
-				outputManager.cleanChannels();
+				else {
+					outputManager.cleanChannels(GlobalParams::midiVoices - 1, GlobalParams::midiVoices);
+				}
 
 				char textToDisplay[16] = {0};
 				sprintf(textToDisplay, "MIDI Voices: %d", GlobalParams::midiVoices);
@@ -1056,7 +1153,7 @@ int main() {
 				lcd.clear();
 				lcd.writeTimed(textToDisplay, 1000);
 
-				sequencer.updateLayerCount();
+				sequencer.updateLayerLayout();
 			}
 		}
 
@@ -1098,9 +1195,7 @@ int main() {
 				if (sequencer.isAcceptingInput()) {
 					sequencer.releaseKey(packet[1]);
 				}
-				else {
-					outputManager.releaseKey(packet[1]);
-				}
+				outputManager.releaseKey(packet[1]);
 			}
 		}
 		midiQueue.clear();
@@ -1114,7 +1209,7 @@ int main() {
 
 		// BPM
 		rateADC.open(ADC_ADDR);
-		uint16_t adcValue;
+		uint16_t adcValue;	
 		rateADC.readData(&adcValue);
 		double bpm = 270 * rateADC.getPotPosition(adcValue + 1) + 30;
 		GlobalParams::bpm = (uint16_t) bpm;
