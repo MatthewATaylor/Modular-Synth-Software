@@ -14,10 +14,12 @@ struct GlobalParams {
 	static uint8_t midiVoices;
 	static uint8_t currentLayer;
 	static uint8_t maxLayer;
+	static uint16_t bpm;
 };
 uint8_t GlobalParams::midiVoices = 8;
 uint8_t GlobalParams::currentLayer = 0;
 uint8_t GlobalParams::maxLayer = 0;
+uint16_t GlobalParams::bpm = 0;
 
 class Timer {
 	public:
@@ -111,9 +113,11 @@ class ADC : public I2CDevice {
 		}
 
 		/*
-		 * Get pot position (0 to 1) given voltage level, needed because of voltage divider on pot output
+		 * Get pot position (0 to 1) given ADC reading, needed because of voltage divider on pot output
 		 */
-		static double getPotPosition(double v) {
+		static double getPotPosition(uint16_t value) {
+			double v = getVoltage(value);
+
 			// Equation represents the inverse of the circuit's transfer function
 			return (500 * v - 33 + sqrt(290000 * v * v - 33000 * v + 1089)) / (1000.0 * v);
 		}
@@ -970,9 +974,11 @@ int main() {
 		printf("Error: Failed to open I2C bus\n");
 		return 1;
 	}
-	
+
 	OutputManager outputManager(i2cFile);
 	Sequencer sequencer(i2cFile);
+
+	ADC rateADC(i2cFile);
 
 	LCD lcd(12, 13, 4, 5, 6, 7);
 	lcd.setup();
@@ -993,6 +999,7 @@ int main() {
 	lcd.clear();
 	lcd.writeDefault();
 
+	uint16_t prevBPM = 0;
 	while (true) {
 		// Change mode (number of MIDI voices for MIDI layer or playing type for seq layer)
 		if (modeButton.wasClicked()) {
@@ -1053,6 +1060,20 @@ int main() {
 		lcd.updateTiming();
 		sequencer.updateLEDs();
 		sequencer.updateSelection();
+
+		rateADC.open(ADC_ADDR);
+		uint16_t adcValue;
+		rateADC.readData(&adcValue);
+		double bpm = 270 * rateADC.getPotPosition(adcValue + 1) + 30;
+		GlobalParams::bpm = (uint16_t) bpm;
+		if (prevBPM != 0 && prevBPM != GlobalParams::bpm) {
+			char textToDisplay[10] = {0};
+			sprintf(textToDisplay, "BPM: %d", GlobalParams::bpm);
+			lcd.clear();
+			lcd.writeTimed(textToDisplay, 1000);
+		}
+		prevBPM = GlobalParams::bpm;
+
 
 		restPin.readValue(&restValue);
 		if (restValue) {
