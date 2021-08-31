@@ -987,12 +987,6 @@ class Sequencer {
 			}
 
 			++keyPressesInSelection;
-
-			for (uint8_t i = 0; i < 8; ++i) {
-				printf("%d ", layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[i]);
-			}
-			printf("        %d", layers[GlobalParams::currentLayer - 1].voicesUsed);
-			printf("\n");
 		}
 
 		void setRest() {
@@ -1011,8 +1005,16 @@ class Sequencer {
 			updateLayerLayout();
 		}
 
-		void setRatchet() {
-			
+		void setRatchet(LCD *lcd) {
+			uint8_t *ratchetDivisions = &(layers[GlobalParams::currentLayer - 1].steps[selectedStep].ratchetDivisions);
+			++(*ratchetDivisions);
+			if (*ratchetDivisions > Step::MAX_RATCHET_DIVISIONS) {
+				*ratchetDivisions = 1;
+			}
+			char textToDisplay[16] = {0};
+			sprintf(textToDisplay, "Divisions: %d", *ratchetDivisions);
+			lcd->clear();
+			lcd->writeTimed(textToDisplay, 1000);
 		}
 
 		// Restart all layers to first beat
@@ -1205,6 +1207,7 @@ int main() {
 	Timer resetTimer;
 
 	DigitalInputPin tiePin(26);
+	tiePin.setup();
 
 	DebouncedButton modeButton(17);
 	DebouncedButton layerDecreaseButton(27);
@@ -1319,7 +1322,7 @@ int main() {
 
 		// Sequencer ratchet
 		if (ratchetButton.wasClicked()) {
-			sequencer.setRatchet();
+			sequencer.setRatchet(&lcd);
 		}
 
 		// Exit and sequencer rest
