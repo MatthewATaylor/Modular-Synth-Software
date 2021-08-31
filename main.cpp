@@ -936,6 +936,9 @@ class Sequencer {
 				}
 				bool state = (statesToRead >> (i % 8)) & 1;
 				if (state) {
+					if (selectedStep != i) {
+						keyPressesInSelection = 0;
+					}
 					selectedStep = i;
 					outputManager->cleanChannels(0, GlobalParams::midiVoices);
 					return;
@@ -949,11 +952,84 @@ class Sequencer {
 		}
 		
 		void pressKey(uint8_t keyID) {
-			layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[0] = keyID;
+			// First key pushed for selection: setReset() and set first channel to key
+			// Following key presses: append noteIDs to step
+			
+			if (keyPressesInSelection == 0) {
+				setReset();
+				layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[0] = keyID;
+			}
+			else {
+				if (GlobalParams::currentLayer == GlobalParams::maxLayer) {
+					uint8_t totalVoicesUsed = GlobalParams::midiVoices;
+					for (uint8_t i = 0; i < GlobalParams::maxLayer; ++i) {
+						totalVoicesUsed += layers[i].voicesUsed;
+					}
+					if (totalVoicesUsed >= OutputManager::NUM_CHANNELS) {
+						return;
+					}
+				}
+				//uint8_t currentLayerVoicesUsed = layers[GlobalParams::currentLayer - 1].voicesUsed;
+				//uint8_t firstChannelID = layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[0];
+				uint8_t currentStepVoicesUsed = 0;
+				for (uint8_t i = 0; i < OutputManager::NUM_CHANNELS; ++i) {
+					uint8_t currentChannelID = layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[i];
+					if (currentChannelID == Step::REST_ID || currentChannelID == Step::RESET_ID) {
+						break;
+					}
+					++currentStepVoicesUsed;
+				}
+				//uint8_t channelToUpdate = currentLayerVoicesUsed;
+
+				layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[currentStepVoicesUsed] = keyID;
+				updateVoicesUsed(GlobalParams::currentLayer - 1);
+				updateLayerLayout();
+			}
+
+			++keyPressesInSelection;
+
+			for (uint8_t i = 0; i < 8; ++i) {
+				printf("%d ", layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[i]);
+			}
+			printf("        %d", layers[GlobalParams::currentLayer - 1].voicesUsed);
+			printf("\n");
 		}
 
-		void releaseKey(uint8_t keyID) {
+		void setRest() {
+			for (uint8_t i = 0; i < OutputManager::NUM_CHANNELS; ++i) {
+				layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[i] = Step::REST_ID;
+			}
+			updateVoicesUsed(GlobalParams::currentLayer - 1);
+			updateLayerLayout();
+		}
+
+		void setReset() {
+			for (uint8_t i = 0; i < OutputManager::NUM_CHANNELS; ++i) {
+				layers[GlobalParams::currentLayer - 1].steps[selectedStep].noteIDs[i] = Step::RESET_ID;
+			}
+			updateVoicesUsed(GlobalParams::currentLayer - 1);
+			updateLayerLayout();
+		}
+
+		void setRatchet() {
 			
+		}
+
+		// Restart all layers to first beat
+		void syncLayers() {
+			for (uint8_t i = 0; i < MAX_LAYERS; ++i) {
+				layers[i].currentStep = 0;
+			}
+		}
+
+		void resetAll() {
+			for (uint8_t i = 0; i < MAX_LAYERS; ++i) {
+				for (uint8_t j = 0; j < NUM_STEPS; ++j) {
+					for (uint8_t k = 0; k < OutputManager::NUM_CHANNELS; ++k) {
+						layers[i].steps[j].noteIDs[k] = Step::RESET_ID;
+					}
+				}
+			}
 		}
 
 		void play() {
@@ -985,7 +1061,7 @@ class Sequencer {
 						for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
 							if (noteIDs[j] == Step::RESET_ID) {
 							       break;
-							}	       
+							}
 							outputManager->turnOnChannel(layers[i].startChannel + j, noteIDs[j]);
 						}
 					}
@@ -1007,7 +1083,10 @@ class Sequencer {
 		struct Step {
 			static const uint8_t REST_ID = 128;
 			static const uint8_t RESET_ID = 129;
+			static const uint8_t MAX_RATCHET_DIVISIONS = 4;
+
 			uint8_t noteIDs[OutputManager::NUM_CHANNELS];
+			uint8_t ratchetDivisions = 1;
 
 			Step() {
 				for (uint8_t i = 0; i < OutputManager::NUM_CHANNELS; ++i) {
@@ -1035,6 +1114,27 @@ class Sequencer {
 
 		Timer stepTimer;
 		bool currentStepTurnedOff = false;
+
+		size_t keyPressesInSelection = 0;
+
+		void updateVoicesUsed(uint8_t layerIndex) {
+			uint8_t maxVoicesUsed = 1;
+			for (uint8_t i = 0; i < NUM_STEPS; ++i) {
+				uint8_t voicesUsedInStep = 1;
+				for (uint8_t j = 0; j < OutputManager::NUM_CHANNELS; ++j) {
+					if (layers[layerIndex].steps[i].noteIDs[j] == Step::RESET_ID || layers[layerIndex].steps[i].noteIDs[j] == Step::REST_ID) {
+						break;
+					}
+					if (j != 0) {
+						++voicesUsedInStep;
+					}
+				}
+				if (voicesUsedInStep > maxVoicesUsed) {
+					maxVoicesUsed = voicesUsedInStep;
+				}
+			}
+			layers[layerIndex].voicesUsed = maxVoicesUsed;
+		}
 };
 
 MIDIPacketQueue midiQueue;
@@ -1099,11 +1199,17 @@ int main() {
 	DigitalInputPin restPin(14);
 	restPin.setup();
 	Timer restTimer;
-	bool restValue = 0;
+
+	DigitalInputPin resetPin(21);
+	resetPin.setup();
+	Timer resetTimer;
+
+	DigitalInputPin tiePin(26);
 
 	DebouncedButton modeButton(17);
 	DebouncedButton layerDecreaseButton(27);
 	DebouncedButton layerIncreaseButton(22);
+	DebouncedButton ratchetButton(20);
 
 	lcd.clear();
 	lcd.writeDefault();
@@ -1167,9 +1273,6 @@ int main() {
 				}
 			}
 			else if (packet[0] == 128) {
-				if (sequencer.isAcceptingInput()) {
-					sequencer.releaseKey(packet[1]);
-				}
 				outputManager.releaseKey(packet[1]);
 			}
 		}
@@ -1186,7 +1289,7 @@ int main() {
 		rateADC.open(ADC_ADDR);
 		uint16_t adcValue;	
 		rateADC.readData(&adcValue);
-		double bpm = 250 * rateADC.getPotPosition(adcValue + 1) + 50;
+		double bpm = 225 * rateADC.getPotPosition(adcValue + 1) + 50;
 		GlobalParams::bpm = (uint16_t) bpm;
 		if (prevBPM != 0 && prevBPM != GlobalParams::bpm) {
 			char textToDisplay[10] = {0};
@@ -1196,11 +1299,38 @@ int main() {
 		}
 		prevBPM = GlobalParams::bpm;
 
-		// Exit
+		// Sequencer reset
+		bool resetValue;
+		resetPin.readValue(&resetValue);
+		if (resetValue) {
+			if (resetTimer.get_s() > 2.5) {
+				sequencer.resetAll();
+			}
+			else if (sequencer.isAcceptingInput()) {
+				sequencer.setReset();
+			}
+			else {
+				sequencer.syncLayers();
+			}
+		}
+		else {
+			resetTimer.set();
+		}
+
+		// Sequencer ratchet
+		if (ratchetButton.wasClicked()) {
+			sequencer.setRatchet();
+		}
+
+		// Exit and sequencer rest
+		bool restValue;
 		restPin.readValue(&restValue);
 		if (restValue) {
-			if (restTimer.get_s() > 3.0) {
+			if (restTimer.get_s() > 2.5) {
 				break;
+			}
+			if (sequencer.isAcceptingInput()) {
+				sequencer.setRest();
 			}
 		}
 		else {
