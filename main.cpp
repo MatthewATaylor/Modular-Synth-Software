@@ -1017,6 +1017,15 @@ class Sequencer {
 			lcd->writeTimed(textToDisplay, 1000);
 		}
 
+		void setTie(LCD *lcd) {
+			bool *isTie = &layers[GlobalParams::currentLayer - 1].steps[selectedStep].isTie;
+			*isTie = !(*isTie);
+			char textToDisplay[12] = {0};
+			sprintf(textToDisplay, "Tie: %s", *isTie ? "On" : "Off");
+			lcd->clear();
+			lcd->writeTimed(textToDisplay, 1000);
+		}
+
 		// Restart all layers to first beat
 		void syncLayers() {
 			for (uint8_t i = 0; i < MAX_LAYERS; ++i) {
@@ -1049,6 +1058,7 @@ class Sequencer {
 				currentStepTurnedOff = true;
 			}
 			for (uint8_t i = 0; i < GlobalParams::maxLayer; ++i) {
+				bool isTie = layers[i].steps[layers[i].currentStep].isTie;
 				if (shouldAdvanceStep) {
 					++layers[i].currentStep;
 					if (layers[i].currentStep == NUM_STEPS) {
@@ -1068,7 +1078,7 @@ class Sequencer {
 						}
 					}
 				}
-				else if (shouldTurnOffStep) {
+				else if (!isTie && shouldTurnOffStep) {
 					for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
 						outputManager->turnOffChannel(layers[i].startChannel + j);
 					}
@@ -1089,6 +1099,9 @@ class Sequencer {
 
 			uint8_t noteIDs[OutputManager::NUM_CHANNELS];
 			uint8_t ratchetDivisions = 1;
+			uint8_t numEnables = 0;
+			uint8_t numDisables = 0;
+			bool isTie = false;
 
 			Step() {
 				for (uint8_t i = 0; i < OutputManager::NUM_CHANNELS; ++i) {
@@ -1206,13 +1219,11 @@ int main() {
 	resetPin.setup();
 	Timer resetTimer;
 
-	DigitalInputPin tiePin(26);
-	tiePin.setup();
-
 	DebouncedButton modeButton(17);
 	DebouncedButton layerDecreaseButton(27);
 	DebouncedButton layerIncreaseButton(22);
 	DebouncedButton ratchetButton(20);
+	DebouncedButton tieButton(26);
 
 	lcd.clear();
 	lcd.writeDefault();
@@ -1323,6 +1334,10 @@ int main() {
 		// Sequencer ratchet
 		if (ratchetButton.wasClicked()) {
 			sequencer.setRatchet(&lcd);
+		}
+
+		if (tieButton.wasClicked()) {
+			sequencer.setTie(&lcd);
 		}
 
 		// Exit and sequencer rest
