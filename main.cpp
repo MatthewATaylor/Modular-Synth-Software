@@ -1035,9 +1035,15 @@ class Sequencer {
 
 		void resetAll() {
 			for (uint8_t i = 0; i < MAX_LAYERS; ++i) {
+				layers[i].currentStep = 0;
 				for (uint8_t j = 0; j < NUM_STEPS; ++j) {
 					for (uint8_t k = 0; k < OutputManager::NUM_CHANNELS; ++k) {
 						layers[i].steps[j].noteIDs[k] = Step::RESET_ID;
+						layers[i].steps[j].ratchetDivisions = 1;
+						layers[i].steps[j].numEnables = 1;
+						layers[i].steps[j].numDisables = 0;
+						layers[i].steps[j].isTie = false;
+						outputManager->turnOffChannel(layers[i].startChannel + k); 
 					}
 				}
 			}
@@ -1045,21 +1051,23 @@ class Sequencer {
 
 		void play() {
 			bool shouldAdvanceStep = false;
-			bool shouldTurnOffStep = false;
 			double secondsPerBeat = 60.0 / GlobalParams::bpm / 4.0;
 			double elapsedSeconds = stepTimer.get_s();
+					
 			if (elapsedSeconds >= secondsPerBeat) {	
 				shouldAdvanceStep = true;
 				stepTimer.set();
-				currentStepTurnedOff = false;
 			}
-			else if (elapsedSeconds >= secondsPerBeat / 2.0 && !currentStepTurnedOff) {
-				shouldTurnOffStep = true;
-				currentStepTurnedOff = true;
-			}
+
 			for (uint8_t i = 0; i < GlobalParams::maxLayer; ++i) {
+				double secondsPerDivision = secondsPerBeat / layers[i].steps[layers[i].currentStep].ratchetDivisions;
 				bool isTie = layers[i].steps[layers[i].currentStep].isTie;
+				bool shouldTurnOnStep = elapsedSeconds >= layers[i].steps[layers[i].currentStep].numEnables * secondsPerDivision;
+				bool shouldTurnOffStep = elapsedSeconds >= (layers[i].steps[layers[i].currentStep].numDisables + 0.5) * secondsPerDivision;
+
 				if (shouldAdvanceStep) {
+					layers[i].steps[layers[i].currentStep].numEnables = 1;
+					layers[i].steps[layers[i].currentStep].numDisables = 0;
 					++layers[i].currentStep;
 					if (layers[i].currentStep == NUM_STEPS) {
 						layers[i].currentStep = 0;
@@ -1078,9 +1086,22 @@ class Sequencer {
 						}
 					}
 				}
-				else if (!isTie && shouldTurnOffStep) {
-					for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
-						outputManager->turnOffChannel(layers[i].startChannel + j);
+				else if (shouldTurnOnStep) {  // For ratchet divisions
+					uint8_t *noteIDs = layers[i].steps[layers[i].currentStep].noteIDs;
+					if (noteIDs[0] != Step::REST_ID) {
+						for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
+							outputManager->turnOnChannel(layers[i].startChannel + j, noteIDs[j]);
+						}
+					}
+					++layers[i].steps[layers[i].currentStep].numEnables;
+				}
+				else if (shouldTurnOffStep) {
+					if (!(isTie && layers[i].steps[layers[i].currentStep].numEnables == layers[i].steps[layers[i].currentStep].ratchetDivisions)) {
+						// Not a tie on the last subdivision
+						for (uint8_t j = 0; j < layers[i].voicesUsed; ++j) {
+							outputManager->turnOffChannel(layers[i].startChannel + j);
+						}
+						++layers[i].steps[layers[i].currentStep].numDisables;
 					}
 				}
 			}
@@ -1099,7 +1120,7 @@ class Sequencer {
 
 			uint8_t noteIDs[OutputManager::NUM_CHANNELS];
 			uint8_t ratchetDivisions = 1;
-			uint8_t numEnables = 0;
+			uint8_t numEnables = 1;
 			uint8_t numDisables = 0;
 			bool isTie = false;
 
@@ -1128,7 +1149,6 @@ class Sequencer {
 		bool selectBlinkIsOn = false;
 
 		Timer stepTimer;
-		bool currentStepTurnedOff = false;
 
 		size_t keyPressesInSelection = 0;
 
