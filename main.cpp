@@ -492,6 +492,14 @@ class LCD {
 			usleep(2000);
 		}
 
+		void setCursorPos(uint8_t row, uint8_t col) {
+			rsPin.writeValue(0);
+			uint8_t pos = row * 0x40 + col;
+
+			writeData(1, (pos & 0b1000000) >> 6, (pos & 0b100000) >> 5, (pos & 0b10000) >> 4);
+			writeData((pos & 0b1000) >> 3, (pos & 0b100) >> 2, (pos & 0b10) >> 1, pos & 1);
+		}
+
 		void writeChar(char character) {
 			rsPin.writeValue(1);
 			bool bits[8] = {0};  // Lower bits ordered first
@@ -515,10 +523,11 @@ class LCD {
 				writeStr("Layer: MIDI");
 			}
 			else {
-				char stringToWrite[10] = {0};
-				sprintf(stringToWrite, "Layer: %d", GlobalParams::currentLayer);
-				writeStr(stringToWrite);
+				char layerStr[10] = {0};
+				sprintf(layerStr, "Layer: %d", GlobalParams::currentLayer);
+				writeStr(layerStr);
 			}
+			writeBPM();
 		}
 
 		void writeTimed(const char *str, double millis) {
@@ -535,6 +544,14 @@ class LCD {
 				writeDefault();
 				isTimed = false;
 			}
+		}
+
+		void updateBPM() {
+			if (isTimed) {
+				return;
+			}
+
+			writeBPM();
 		}
 
 	private:
@@ -558,6 +575,13 @@ class LCD {
 			db5Pin.writeValue(db5);
 			db4Pin.writeValue(db4);
 			pulseEnable();
+		}
+
+		void writeBPM() {
+			setCursorPos(1, 0);
+			char bpmStr[12] = {0};
+			sprintf(bpmStr, "BPM: %3d", GlobalParams::bpm);
+			writeStr(bpmStr);
 		}
 };
 
@@ -712,12 +736,8 @@ class OutputManager {
 		}
 
 		void turnOnChannel(uint8_t channel, uint8_t keyID) {
-			double outputVoltage = (keyID - 53) / 12.0;
-			uint16_t dacValue = (uint16_t) (outputVoltage / 5.0 * 4095);
-			
-			dac.open(DAC_ADDR);
-			dac.writeData(dacValue, DAC::Command::WRITE_UPDATE, channel);
-			
+			writeToDAC(keyID, channel);
+
 			gpio.open(GPIO_EXPANDER_ADDR);
 			gpio.writePin(GPIOExpander::Port::A, channel, 1);
 			gpio.writePin(GPIOExpander::Port::B, channel, 1);
@@ -734,9 +754,18 @@ class OutputManager {
 			channels[channel].gateIsOn = false;
 		}
 
+		void setPitchBend(double pitchBend) {
+			dac.open(DAC_ADDR);
+			for (uint8_t i = 0; i < NUM_CHANNELS; ++i) {
+				channels[i].pitchBend = pitchBend;
+				writeToDAC(channels[i].keyID, i, false);
+			}
+		}
+
 	private:
 		struct OutputChannel {
 			uint8_t keyID = 0;  // 0-127
+			double pitchBend = 0;
 			bool gateIsOn = false;
 			bool triggerIsOn = false;
 			Timer triggerTimer;
@@ -752,6 +781,17 @@ class OutputManager {
 		OutputChannel channels[NUM_CHANNELS];
 		DAC dac;
 		GPIOExpander gpio;
+
+		void writeToDAC(uint8_t keyID, uint8_t channel, bool shouldOpenDAC = true) {
+			double outputVoltage = ((double) keyID - 53 + channels[channel].pitchBend) / 12.0;
+			uint16_t dacValue = (uint16_t) (outputVoltage / 5.0 * 4095);
+			
+			if (shouldOpenDAC) {
+				dac.open(DAC_ADDR);
+			}
+
+			dac.writeData(dacValue, DAC::Command::WRITE_UPDATE, channel);
+		}
 
 		bool turnOnKey(uint8_t keyID) {
 			uint8_t channelToWrite = NUM_CHANNELS;
@@ -1309,6 +1349,9 @@ int main() {
 			else if (packet[0] == 128) {
 				outputManager.releaseKey(packet[1]);
 			}
+			else if (packet[0] == 224) {
+				outputManager.setPitchBend((((double) packet[2] - 64) / 64.0) * 3);
+			}
 		}
 		midiQueue.clear();
 		pthread_mutex_unlock(&midiLock);
@@ -1325,11 +1368,8 @@ int main() {
 		rateADC.readData(&adcValue);
 		double bpm = 225 * rateADC.getPotPosition(adcValue + 1) + 50;
 		GlobalParams::bpm = (uint16_t) bpm;
-		if (prevBPM != 0 && prevBPM != GlobalParams::bpm) {
-			char textToDisplay[10] = {0};
-			sprintf(textToDisplay, "BPM: %d", GlobalParams::bpm);
-			lcd.clear();
-			lcd.writeTimed(textToDisplay, 1000);
+		if (prevBPM != GlobalParams::bpm) {
+			lcd.updateBPM();
 		}
 		prevBPM = GlobalParams::bpm;
 
