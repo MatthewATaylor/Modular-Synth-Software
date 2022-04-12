@@ -1258,6 +1258,22 @@ int main() {
 		return 1;
 	}
 
+	DAC dac(i2cFile);
+	dac.open(0b1001000);
+/*
+	while (true) {
+		dac.writeData(1000, DAC::Command::WRITE_UPDATE, 0);
+		dac.writeData(1200, DAC::Command::WRITE_UPDATE, 1);
+		dac.writeData(1400, DAC::Command::WRITE_UPDATE, 2);
+		dac.writeData(1600, DAC::Command::WRITE_UPDATE, 3);
+		dac.writeData(1800, DAC::Command::WRITE_UPDATE, 4);
+		dac.writeData(2000, DAC::Command::WRITE_UPDATE, 5);
+		dac.writeData(2200, DAC::Command::WRITE_UPDATE, 6);
+		dac.writeData(2400, DAC::Command::WRITE_UPDATE, 7);
+	}
+*/
+
+/*
 	OutputManager outputManager(i2cFile);
 	Sequencer sequencer(i2cFile, &outputManager);
 
@@ -1423,7 +1439,7 @@ int main() {
 	usleep(3000000);
 	lcd.clear();
 	lcd.returnHome();
-
+*/
 	return 0;
 }
 
