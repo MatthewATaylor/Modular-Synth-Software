@@ -10,13 +10,10 @@
 #include <time.h>
 #include <signal.h>
 
-#include "../include/Timer.h"
-#include "../include/DAC.h"
-#include "../include/GPIOExpander.h"
-#include "../include/DigitalInputPin.h"
 #include "../include/LCD.h"
 #include "../include/MIDIPacketQueue.h"
 #include "../include/DebouncedButton.h"
+#include "../include/OutputManager.h"
 
 MIDIPacketQueue midiQueue;
 pthread_t midiThread;
@@ -92,18 +89,13 @@ int main() {
 		return 1;
 	}
 
-	DAC dac(i2cFile);
-	dac.open(0b1001000);
-
 	LCD lcd(4, 5, 6, 7, 8, 9);
 	lcd.setup();
-	lcd.writeStr("Hello!");
 
-	DigitalInputPin outputButton(16);
-	outputButton.setup();
+	DebouncedButton outputButton(16);
+	DebouncedButton channelButton(17);
 
-	DigitalInputPin channelButton(17);
-	channelButton.setup();
+	OutputManager outManager(i2cFile, &lcd, &outputButton, &channelButton);
 
 	midiInit();
 
@@ -116,26 +108,45 @@ int main() {
 			if (command == 0b1001) {
 				// Key pressed
 				printf("Key pressed on channel %d (%d, %d)\n", channel, packet[1], packet[2]);
+				outManager.pressKey(packet[1], channel);
 			}
 			else if (command == 0b1000) {
 				// Key released
 				printf("Key released on channel %d (%d, %d)\n", channel, packet[1], packet[2]);
+				outManager.releaseKey(packet[1], channel);
 			}
 			else if (command == 0b1110) {
 				// Pitch bend
 				printf("Pitch bend on channel %d\n", channel);
 			}
+			else if (command == 0b1011 && packet[1] > 122) {
+				printf("Turning all notes off on channel %d\n", channel);
+				outManager.turnOffChannel(channel);
+			}
+			else {
+				printf("Unknown command %d on channel %d (%d, %d)\n", command, channel, packet[1], packet[2]);
+			}
 		}
 		midiQueue.clear();
 		pthread_mutex_unlock(&midiLock);
 
-		bool outputButtonVal = 0;
-		outputButton.readValue(&outputButtonVal);
-		if (outputButtonVal) {
+		outManager.updateTriggers();
+		outManager.updateSelectedOutput();
+		outManager.updateChannelAssignments();
+
+		if (outputButton.isPressed() && channelButton.isPressed() && outputButton.getHoldTime_s() > 5 && channelButton.getHoldTime_s() > 5) {
+			lcd.clear();
+			lcd.returnHome();
+			lcd.writeStr("Exiting...");
+			usleep(3000000);
 			break;
 		}
 
-		usleep(500);
+		usleep(100);
+	}
+
+	for (uint8_t i = 0; i < 8; ++i) {
+		outManager.turnOffChannel(i);
 	}
 
 	lcd.clear();
